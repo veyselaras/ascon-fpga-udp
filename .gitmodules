@@ -1,0 +1,3 @@
+[submodule "fpga/rtl/ascon-verilog"]
+	path = fpga/rtl/ascon-verilog
+	url = https://github.com/rprimas/ascon-verilog.git
