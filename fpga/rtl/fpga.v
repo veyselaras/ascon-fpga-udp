@@ -30,10 +30,14 @@ THE SOFTWARE.
 
 /*
  * FPGA top-level module
+ * PLL outputs:
+ *   CLK0 = 125 MHz (Ethernet MAC)
+ *   CLK1 = 125 MHz + 90° (RGMII TX)
+ *   CLK2 = 62.5 MHz (ASCON encryption)
  */
 module fpga (
     /*
-     * Clock: 125MHz
+     * Clock: 50MHz
      */
     input  wire        CLOCK_50,
 
@@ -73,30 +77,48 @@ module fpga (
     input  wire [3:0]  ENET1_RX_DATA,
     input  wire        ENET1_RX_DV,
     output wire        ENET1_RST_N,
-    input  wire        ENET1_INT_N
+    input  wire        ENET1_INT_N,
+
+    /*
+     * UART
+     */
+    input  wire        UART_RXD
 );
 
-// Clock and reset
+// ================================================================
+// Clock and Reset
+// ================================================================
+wire [4:0] pll_clk;     // PLL clock outputs (5-bit wide)
+wire       clk_int;     // 125 MHz
+wire       clk90_int;   // 125 MHz + 90°
+wire       clk_slow;    // 62.5 MHz
+wire       rst_int;     // 125 MHz domain reset
+wire       rst_slow;    // 62.5 MHz domain reset
 
-// Internal 125 MHz clock
-wire clk_int;
-wire rst_int;
+assign clk_int   = pll_clk[0];  // CLK0: 125 MHz
+assign clk90_int = pll_clk[1];  // CLK1: 125 MHz + 90°
+assign clk_slow  = pll_clk[2];  // CLK2: 62.5 MHz
 
 wire pll_rst = ~KEY[3];
 wire pll_locked;
 
-wire clk90_int;
-
 altpll #(
     .bandwidth_type("AUTO"),
+    // CLK0: 125 MHz = 50 * 5 / 2
     .clk0_divide_by(2),
     .clk0_duty_cycle(50),
     .clk0_multiply_by(5),
     .clk0_phase_shift("0"),
+    // CLK1: 125 MHz + 90° phase shift
     .clk1_divide_by(2),
     .clk1_duty_cycle(50),
     .clk1_multiply_by(5),
     .clk1_phase_shift("2000"),
+    // CLK2: 62.5 MHz = 50 * 5 / 4 (for ASCON core)
+    .clk2_divide_by(4),
+    .clk2_duty_cycle(50),
+    .clk2_multiply_by(5),
+    .clk2_phase_shift("0"),
     .compensate_clock("CLK0"),
     .inclk0_input_frequency(20000),
     .intended_device_family("Cyclone IV E"),
@@ -129,7 +151,7 @@ altpll #(
     .port_scanwrite("PORT_UNUSED"),
     .port_clk0("PORT_USED"),
     .port_clk1("PORT_USED"),
-    .port_clk2("PORT_UNUSED"),
+    .port_clk2("PORT_USED"),       // <<< CLK2 enabled for 62.5MHz
     .port_clk3("PORT_UNUSED"),
     .port_clk4("PORT_UNUSED"),
     .port_clk5("PORT_UNUSED"),
@@ -149,7 +171,7 @@ altpll #(
 altpll_component (
     .areset(pll_rst),
     .inclk({1'b0, CLOCK_50}),
-    .clk({clk90_int, clk_int}),
+    .clk(pll_clk),              // <<< 5-bit wire, CLK0/1/2 all come out here
     .locked(pll_locked),
     .activeclock(),
     .clkbad(),
@@ -186,6 +208,7 @@ altpll_component (
     .vcounderrange()
 );
 
+// Reset synchronizer for 125MHz domain
 sync_reset #(
     .N(4)
 )
@@ -195,7 +218,19 @@ sync_reset_inst (
     .out(rst_int)
 );
 
+// Reset synchronizer for 62.5MHz domain
+sync_reset #(
+    .N(4)
+)
+sync_reset_slow_inst (
+    .clk(clk_slow),
+    .rst(~pll_locked),
+    .out(rst_slow)
+);
+
+// ================================================================
 // GPIO
+// ================================================================
 wire [3:0] btn_int;
 wire [17:0] sw_int;
 
@@ -213,17 +248,22 @@ debounce_switch_inst (
         sw_int})
 );
 
+// ================================================================
+// FPGA Core
+// ================================================================
 fpga_core #(
     .TARGET("ALTERA")
 )
 core_inst (
     /*
-     * Clock: 125MHz
+     * Clock: 125MHz + 62.5MHz
      * Synchronous reset
      */
     .clk(clk_int),
     .clk90(clk90_int),
+    .clk_slow(clk_slow),       // <<< 62.5MHz for ASCON
     .rst(rst_int),
+    .rst_slow(rst_slow),       // <<< 62.5MHz domain reset
 
     /*
      * GPIO
@@ -261,7 +301,12 @@ core_inst (
     .phy1_txd(ENET1_TX_DATA),
     .phy1_tx_ctl(ENET1_TX_EN),
     .phy1_reset_n(ENET1_RST_N),
-    .phy1_int_n(ENET1_INT_N)
+    .phy1_int_n(ENET1_INT_N),
+
+    /*
+     * UART
+     */
+    .uart_rxd(UART_RXD)
 );
 
 endmodule

@@ -29,10 +29,13 @@ THE SOFTWARE.
 `default_nettype none
 
 /*
- * FPGA core logic - ASCON-AEAD128 encryption with CDC
+ * FPGA1 core logic - UART RX → ASCON Encrypt → Ethernet TX
  *
  * Data path:
- *   125MHz: UDP RX → async_fifo → 62.5MHz: ASCON wrapper → async_fifo → 125MHz: UDP TX
+ *   PC1 → UART RX → async FIFO (125→62.5MHz) → ASCON encrypt → async FIFO (62.5→125MHz) → UDP TX → FPGA2
+ *
+ * Ethernet RX is only used for ARP responses (no data path).
+ * UDP RX payload is drained (accepted and discarded) to prevent UDP stack from stalling.
  */
 module fpga_core #
 (
@@ -75,8 +78,25 @@ module fpga_core #
     output wire [3:0] phy1_txd,
     output wire       phy1_tx_ctl,
     output wire       phy1_reset_n,
-    input  wire       phy1_int_n
+    input  wire       phy1_int_n,
+
+    /*
+     * UART interface (directly exposed from fpga.v)
+     */
+    input  wire       uart_rxd    // RS-232 RX pin (from PC1 via USB-RS232 adapter)
 );
+
+// ================================================================
+// FPGA2 address configuration (hardcoded destination)
+// ================================================================
+localparam [31:0] FPGA2_IP   = {8'd192, 8'd168, 8'd1, 8'd129};
+localparam [15:0] UDP_PORT   = 16'd1234;
+
+// ================================================================
+// UART parameters
+// ================================================================
+// 125 MHz / (115200 baud * 8) = ~136
+localparam UART_PRESCALE = 125000000 / (115200 * 8);
 
 // ================================================================
 // Internal wires
@@ -204,12 +224,16 @@ wire tx_udp_payload_axis_tready;
 wire tx_udp_payload_axis_tlast;
 wire tx_udp_payload_axis_tuser;
 
-// RX filtered payload (125MHz domain, port matched)
-wire [7:0] rx_filt_tdata;
-wire rx_filt_tvalid;
-wire rx_filt_tready;
-wire rx_filt_tlast;
-wire rx_filt_tuser;
+// UART RX output (AXI-Stream, 125MHz domain, no tlast)
+wire [7:0] uart_rx_tdata;
+wire       uart_rx_tvalid;
+wire       uart_rx_tready;
+
+// UART RX with tlast added (125MHz domain)
+wire [7:0] uart_pkt_tdata;
+wire       uart_pkt_tvalid;
+wire       uart_pkt_tready;
+wire       uart_pkt_tlast;
 
 // Async FIFO RX output (62.5MHz domain → ASCON input)
 wire [7:0] slow_rx_tdata;
@@ -235,7 +259,9 @@ wire [31:0] local_ip    = {8'd192, 8'd168, 8'd1,   8'd128};
 wire [31:0] gateway_ip  = {8'd192, 8'd168, 8'd1,   8'd1};
 wire [31:0] subnet_mask = {8'd255, 8'd255, 8'd255, 8'd0};
 
-// IP ports not used
+// ================================================================
+// IP ports not used — assign defaults
+// ================================================================
 assign rx_ip_hdr_ready = 1;
 assign rx_ip_payload_axis_tready = 1;
 assign tx_ip_hdr_valid = 0;
@@ -252,98 +278,173 @@ assign tx_ip_payload_axis_tlast = 0;
 assign tx_ip_payload_axis_tuser = 0;
 
 // ================================================================
-// UDP RX port matching (port 1234)
+// UDP RX — drain all incoming payload (we don't use Ethernet RX for data)
+// ARP still works because udp_complete handles ARP at Ethernet frame level,
+// independent of the UDP payload path.
 // ================================================================
-wire match_cond = rx_udp_dest_port == 1234;
-wire no_match = !match_cond;
+assign rx_udp_hdr_ready = 1;                       // always accept headers
+assign rx_udp_payload_axis_tready = 1;             // always drain payload
 
-reg match_cond_reg = 0;
-reg no_match_reg = 0;
+// ================================================================
+// TX UDP Header — hardcoded destination (FPGA2)
+// No header latch needed since we don't use RX headers.
+// Header is sent when ASCON output is ready.
+// ================================================================
+reg hdr_pending = 0;
+reg hdr_sent = 0;
 
 always @(posedge clk) begin
     if (rst) begin
-        match_cond_reg <= 0;
-        no_match_reg <= 0;
+        hdr_pending <= 0;
+        hdr_sent    <= 0;
     end else begin
-        if (rx_udp_payload_axis_tvalid) begin
-            if ((!match_cond_reg && !no_match_reg) ||
-                (rx_udp_payload_axis_tvalid && rx_udp_payload_axis_tready && rx_udp_payload_axis_tlast)) begin
-                match_cond_reg <= match_cond;
-                no_match_reg <= no_match;
-            end
-        end else begin
-            match_cond_reg <= 0;
-            no_match_reg <= 0;
-        end
-    end
-end
-
-// RX payload filtering (125MHz domain)
-assign rx_filt_tdata  = rx_udp_payload_axis_tdata;
-assign rx_filt_tvalid = rx_udp_payload_axis_tvalid && match_cond_reg;
-assign rx_udp_payload_axis_tready = (rx_filt_tready && match_cond_reg) || no_match_reg;
-assign rx_filt_tlast  = rx_udp_payload_axis_tlast;
-assign rx_filt_tuser  = rx_udp_payload_axis_tuser;
-
-// ================================================================
-// Header latch (125MHz domain)
-// ================================================================
-reg [31:0] latched_src_ip = 0;
-reg [15:0] latched_src_port = 0;
-reg [15:0] latched_dst_port = 0;
-reg [15:0] latched_udp_length = 0;
-reg        hdr_pending = 0;
-reg        hdr_sent = 0;
-
-always @(posedge clk) begin
-    if (rst) begin
-        latched_src_ip     <= 0;
-        latched_src_port   <= 0;
-        latched_dst_port   <= 0;
-        latched_udp_length <= 0;
-        hdr_pending        <= 0;
-        hdr_sent           <= 0;
-    end else begin
-        if (rx_udp_hdr_valid && match_cond && !hdr_pending && !hdr_sent) begin
-            latched_src_ip     <= rx_udp_ip_source_ip;
-            latched_src_port   <= rx_udp_source_port;
-            latched_dst_port   <= rx_udp_dest_port;
-            latched_udp_length <= rx_udp_length;
-            hdr_pending        <= 1;
+        // When ASCON output becomes valid, start sending header
+        if (ascon_out_tvalid && !hdr_pending && !hdr_sent) begin
+            hdr_pending <= 1;
         end
 
-        if (hdr_pending && ascon_out_tvalid && tx_udp_hdr_ready) begin
+        // Header accepted by UDP stack
+        if (hdr_pending && tx_udp_hdr_ready) begin
             hdr_pending <= 0;
             hdr_sent    <= 1;
         end
 
+        // Packet finished (tlast), ready for next packet
         if (hdr_sent && ascon_out_tvalid && ascon_out_tready && ascon_out_tlast) begin
             hdr_sent <= 0;
         end
     end
 end
 
-// ================================================================
-// TX UDP Header (125MHz domain)
-// ================================================================
-assign tx_udp_hdr_valid = hdr_pending && ascon_out_tvalid;
-assign rx_udp_hdr_ready = (!hdr_pending && !hdr_sent && match_cond) || no_match;
-assign tx_udp_ip_dscp = 0;
-assign tx_udp_ip_ecn = 0;
-assign tx_udp_ip_ttl = 64;
-assign tx_udp_ip_source_ip = local_ip;
-assign tx_udp_ip_dest_ip = latched_src_ip;
-assign tx_udp_source_port = latched_dst_port;
-assign tx_udp_dest_port = latched_src_port;
-assign tx_udp_length = latched_udp_length + 16'd36;
-assign tx_udp_checksum = 0;
+assign tx_udp_hdr_valid    = hdr_pending;
+assign tx_udp_ip_dscp      = 0;
+assign tx_udp_ip_ecn       = 0;
+assign tx_udp_ip_ttl       = 64;
+assign tx_udp_ip_source_ip = local_ip;             // 192.168.1.128
+assign tx_udp_ip_dest_ip   = FPGA2_IP;             // 192.168.1.129 (hardcoded)
+assign tx_udp_source_port  = UDP_PORT;              // 1234
+assign tx_udp_dest_port    = UDP_PORT;              // 1234
+assign tx_udp_checksum     = 0;
 
-// TX payload (125MHz domain, gated by hdr_sent)
+// ================================================================
+// TX UDP Length — we don't know payload size in advance from UART.
+// Set to 0, udp_complete will calculate it from tlast.
+// NOTE: If udp_complete doesn't support length=0, we need to
+// track byte count. For now try 0 (auto-calculate).
+// ================================================================
+assign tx_udp_length = 0;
+
+// ================================================================
+// TX UDP Payload — ASCON output → UDP TX (gated by hdr_sent)
+// Payload only flows after header has been accepted by UDP stack.
+// ================================================================
 assign tx_udp_payload_axis_tdata  = ascon_out_tdata;
 assign tx_udp_payload_axis_tvalid = hdr_sent ? ascon_out_tvalid : 1'b0;
 assign ascon_out_tready           = hdr_sent ? tx_udp_payload_axis_tready : 1'b0;
 assign tx_udp_payload_axis_tlast  = ascon_out_tlast;
 assign tx_udp_payload_axis_tuser  = 1'b0;
+
+// ================================================================
+// UART RX Module (alexforencich/verilog-uart)
+// Receives bytes from PC1 via RS-232.
+// Output: AXI-Stream 8-bit, no tlast (UART is continuous byte stream).
+// ================================================================
+uart_rx #(
+    .DATA_WIDTH(8)
+)
+uart_rx_inst (
+    .clk(clk),
+    .rst(rst),
+
+    // AXI-Stream output
+    .m_axis_tdata(uart_rx_tdata),
+    .m_axis_tvalid(uart_rx_tvalid),
+    .m_axis_tready(uart_rx_tready),
+
+    // UART interface
+    .rxd(uart_rxd),
+
+    // Status (unused)
+    .busy(),
+    .overrun_error(),
+    .frame_error(),
+
+    // Baud rate: prescale = clk / (baud * 8)
+    .prescale(UART_PRESCALE)
+);
+
+// ================================================================
+// UART Packet Framer — adds tlast to UART byte stream
+//
+// UART has no packet boundaries. We use a timeout mechanism:
+// If no new byte arrives within TIMEOUT clock cycles after the last byte,
+// we consider the packet complete and assert tlast on the last byte.
+//
+// At 115200 baud, one byte takes ~87us = ~10,875 cycles @ 125MHz.
+// Timeout of 50,000 cycles = ~0.4ms = about 4.5 byte periods.
+// This gives PC enough time between bytes but catches end-of-message.
+// ================================================================
+// ================================================================
+// UART Packet Framer — DÜZELTILMIS
+// Byte'ı tutar, yeni byte gelirse öncekini tlast=0 ile gönderir,
+// timeout olursa tlast=1 ile gönderir.
+// ================================================================
+localparam UART_TIMEOUT = 16'd50000;
+
+reg [15:0] idle_counter = 0;
+reg [7:0]  out_data = 0;
+reg [7:0]  held_data = 0;
+reg        held_valid = 0;
+reg        can_output = 0;
+reg        held_last = 0;
+
+assign uart_pkt_tdata  = out_data;
+assign uart_pkt_tvalid = can_output;
+assign uart_pkt_tlast  = held_last;
+assign uart_rx_tready  = !can_output;  // yeni byte kabul et, output meşgul değilse
+
+always @(posedge clk) begin
+    if (rst) begin
+        idle_counter <= 0;
+        held_data    <= 0;
+        out_data     <= 0;
+        held_valid   <= 0;
+        can_output   <= 0;
+        held_last    <= 0;
+    end else begin
+        // Çıkış tüketildi
+        if (can_output && uart_pkt_tready) begin
+            can_output <= 0;
+            held_last  <= 0;
+        end
+
+        // Yeni byte geldi
+        if (uart_rx_tvalid && uart_rx_tready) begin
+            if (held_valid) begin
+                // Önceki byte'ı çıkışa gönder (tlast=0)
+                out_data   <= held_data;
+                can_output <= 1;
+                held_last  <= 0;
+            end
+            // Yeni byte'ı buffer'a al
+            held_data    <= uart_rx_tdata;
+            held_valid   <= 1;
+            idle_counter <= 0;
+        end else if (held_valid && !can_output) begin
+            // Yeni byte yok, timeout say
+            if (idle_counter < UART_TIMEOUT) begin
+                idle_counter <= idle_counter + 1;
+            end else begin
+                // Timeout — son byte'ı tlast=1 ile gönder
+                out_data     <= held_data;
+                can_output   <= 1;
+                held_last    <= 1;
+                held_valid   <= 0;
+                idle_counter <= 0;
+            end
+        end
+    end
+end
 
 // ================================================================
 // LED displays
@@ -393,7 +494,7 @@ assign phy1_reset_n = ~rst;
 assign gpio = 0;
 
 // ================================================================
-// Ethernet MAC (125MHz)
+// Ethernet MAC (125MHz) — handles both ARP and UDP frames
 // ================================================================
 eth_mac_1g_rgmii_fifo #(
     .TARGET(TARGET),
@@ -487,6 +588,7 @@ eth_axis_tx eth_axis_tx_inst (
 udp_complete udp_complete_inst (
     .clk(clk),
     .rst(rst),
+    // Ethernet frame input — needed for ARP
     .s_eth_hdr_valid(rx_eth_hdr_valid),
     .s_eth_hdr_ready(rx_eth_hdr_ready),
     .s_eth_dest_mac(rx_eth_dest_mac),
@@ -497,6 +599,7 @@ udp_complete udp_complete_inst (
     .s_eth_payload_axis_tready(rx_eth_payload_axis_tready),
     .s_eth_payload_axis_tlast(rx_eth_payload_axis_tlast),
     .s_eth_payload_axis_tuser(rx_eth_payload_axis_tuser),
+    // Ethernet frame output — needed for ARP replies and UDP TX
     .m_eth_hdr_valid(tx_eth_hdr_valid),
     .m_eth_hdr_ready(tx_eth_hdr_ready),
     .m_eth_dest_mac(tx_eth_dest_mac),
@@ -507,6 +610,7 @@ udp_complete udp_complete_inst (
     .m_eth_payload_axis_tready(tx_eth_payload_axis_tready),
     .m_eth_payload_axis_tlast(tx_eth_payload_axis_tlast),
     .m_eth_payload_axis_tuser(tx_eth_payload_axis_tuser),
+    // IP frame input — not used
     .s_ip_hdr_valid(tx_ip_hdr_valid),
     .s_ip_hdr_ready(tx_ip_hdr_ready),
     .s_ip_dscp(tx_ip_dscp),
@@ -521,6 +625,7 @@ udp_complete udp_complete_inst (
     .s_ip_payload_axis_tready(tx_ip_payload_axis_tready),
     .s_ip_payload_axis_tlast(tx_ip_payload_axis_tlast),
     .s_ip_payload_axis_tuser(tx_ip_payload_axis_tuser),
+    // IP frame output — not used
     .m_ip_hdr_valid(rx_ip_hdr_valid),
     .m_ip_hdr_ready(rx_ip_hdr_ready),
     .m_ip_eth_dest_mac(rx_ip_eth_dest_mac),
@@ -544,6 +649,7 @@ udp_complete udp_complete_inst (
     .m_ip_payload_axis_tready(rx_ip_payload_axis_tready),
     .m_ip_payload_axis_tlast(rx_ip_payload_axis_tlast),
     .m_ip_payload_axis_tuser(rx_ip_payload_axis_tuser),
+    // UDP frame input — ASCON encrypted payload goes here
     .s_udp_hdr_valid(tx_udp_hdr_valid),
     .s_udp_hdr_ready(tx_udp_hdr_ready),
     .s_udp_ip_dscp(tx_udp_ip_dscp),
@@ -560,6 +666,7 @@ udp_complete udp_complete_inst (
     .s_udp_payload_axis_tready(tx_udp_payload_axis_tready),
     .s_udp_payload_axis_tlast(tx_udp_payload_axis_tlast),
     .s_udp_payload_axis_tuser(tx_udp_payload_axis_tuser),
+    // UDP frame output — drained (not used for data)
     .m_udp_hdr_valid(rx_udp_hdr_valid),
     .m_udp_hdr_ready(rx_udp_hdr_ready),
     .m_udp_eth_dest_mac(rx_udp_eth_dest_mac),
@@ -587,6 +694,7 @@ udp_complete udp_complete_inst (
     .m_udp_payload_axis_tready(rx_udp_payload_axis_tready),
     .m_udp_payload_axis_tlast(rx_udp_payload_axis_tlast),
     .m_udp_payload_axis_tuser(rx_udp_payload_axis_tuser),
+    // Status
     .ip_rx_busy(),
     .ip_tx_busy(),
     .udp_rx_busy(),
@@ -600,6 +708,7 @@ udp_complete udp_complete_inst (
     .udp_rx_error_header_early_termination(),
     .udp_rx_error_payload_early_termination(),
     .udp_tx_error_payload_early_termination(),
+    // Configuration
     .local_mac(local_mac),
     .local_ip(local_ip),
     .gateway_ip(gateway_ip),
@@ -608,7 +717,8 @@ udp_complete udp_complete_inst (
 );
 
 // ================================================================
-// Async FIFO: 125MHz → 62.5MHz (RX side, plaintext into ASCON)
+// Async FIFO: 125MHz → 62.5MHz
+// UART RX (with tlast) → ASCON encrypt input
 // ================================================================
 axis_async_fifo #(
     .DEPTH(4096),
@@ -621,19 +731,19 @@ axis_async_fifo #(
     .FRAME_FIFO(0)
 )
 rx_async_fifo (
-    // Write side (125MHz)
+    // Write side (125MHz) — from UART packet framer
     .s_clk(clk),
     .s_rst(rst),
-    .s_axis_tdata(rx_filt_tdata),
+    .s_axis_tdata(uart_pkt_tdata),
     .s_axis_tkeep(0),
-    .s_axis_tvalid(rx_filt_tvalid),
-    .s_axis_tready(rx_filt_tready),
-    .s_axis_tlast(rx_filt_tlast),
+    .s_axis_tvalid(uart_pkt_tvalid),
+    .s_axis_tready(uart_pkt_tready),
+    .s_axis_tlast(uart_pkt_tlast),
     .s_axis_tid(0),
     .s_axis_tdest(0),
     .s_axis_tuser(0),
 
-    // Read side (62.5MHz)
+    // Read side (62.5MHz) — to ASCON wrapper
     .m_clk(clk_slow),
     .m_rst(rst_slow),
     .m_axis_tdata(slow_rx_tdata),
@@ -655,18 +765,18 @@ rx_async_fifo (
 
 // ================================================================
 // ASCON Encryption Wrapper (62.5MHz domain)
+// Input: plaintext from UART
+// Output: nonce + AD + ciphertext + tag
 // ================================================================
 ascon_udp_wrapper ascon_wrap_inst (
     .clk       (clk_slow),
     .rst_n     (~rst_slow),
 
-    // Input: from RX async FIFO (62.5MHz)
     .s_axis_tdata  (slow_rx_tdata),
     .s_axis_tvalid (slow_rx_tvalid),
     .s_axis_tready (slow_rx_tready),
     .s_axis_tlast  (slow_rx_tlast),
 
-    // Output: encrypted (62.5MHz)
     .m_axis_tdata  (slow_tx_tdata),
     .m_axis_tvalid (slow_tx_tvalid),
     .m_axis_tready (slow_tx_tready),
@@ -674,7 +784,8 @@ ascon_udp_wrapper ascon_wrap_inst (
 );
 
 // ================================================================
-// Async FIFO: 62.5MHz → 125MHz (TX side, encrypted to UDP TX)
+// Async FIFO: 62.5MHz → 125MHz
+// ASCON encrypted output → UDP TX
 // ================================================================
 axis_async_fifo #(
     .DEPTH(4096),
@@ -687,7 +798,7 @@ axis_async_fifo #(
     .FRAME_FIFO(0)
 )
 tx_async_fifo (
-    // Write side (62.5MHz)
+    // Write side (62.5MHz) — from ASCON wrapper
     .s_clk(clk_slow),
     .s_rst(rst_slow),
     .s_axis_tdata(slow_tx_tdata),
@@ -699,7 +810,7 @@ tx_async_fifo (
     .s_axis_tdest(0),
     .s_axis_tuser(0),
 
-    // Read side (125MHz)
+    // Read side (125MHz) — to UDP TX
     .m_clk(clk),
     .m_rst(rst),
     .m_axis_tdata(ascon_out_tdata),
