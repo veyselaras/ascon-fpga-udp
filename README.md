@@ -1,4 +1,4 @@
-# ASCON-AEAD128 Hardware Encryption over UDP
+# ASCON-AEAD128 Hardware Encryption-Decryption over UDP
 
 Real-time authenticated encryption on a DE2-115 FPGA board using the ASCON lightweight cipher (NIST SP 800-232). Plaintext UDP packets are encrypted in hardware and returned with a cryptographic authentication tag.
 
