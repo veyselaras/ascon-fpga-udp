@@ -95,9 +95,8 @@ Two separate subnets ensure plaintext and encrypted traffic are physically separ
 
 | Resource | Used | Available | Utilization |
 |----------|------|-----------|-------------|
-| Logic Elements | ~30,000 | 114,480 | ~26% |
-| M9K Memory Blocks | ~16 | 432 | ~4% |
-| Registers | ~8,000 | - | - |
+| Logic Elements | 15,562 | 114,480 | ~14% |
+| Registers | 8,010 | - | - |
 | PLLs | 1 | 4 | 25% |
 
 ## Hardware
