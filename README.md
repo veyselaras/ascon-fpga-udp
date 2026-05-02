@@ -1,5 +1,6 @@
 # ASCON-AEAD128 FPGA Encryption Gateway
 
+
 A real-time hardware encryption gateway built on the **Terasic DE2-115 FPGA** (Cyclone IV E). The FPGA sits between a device and the network, encrypting all outgoing traffic and decrypting all incoming traffic — transparently and entirely in hardware.
 
 Uses the **ASCON-AEAD128** algorithm, standardized by NIST as [SP 800-232](https://csrc.nist.gov/pubs/sp/800/232/final) for lightweight authenticated encryption.
