@@ -1255,7 +1255,9 @@ set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
 set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
 set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
 set_global_assignment -name POWER_PRESET_COOLING_SOLUTION "23 MM HEAT SINK WITH 200 LFPM AIRFLOW"
-set_global_assignment -name VERILOG_FILE ../rtl/uart_rx.v
+set_global_assignment -name OPTIMIZATION_MODE BALANCED
+set_global_assignment -name VERILOG_FILE ../rtl/true_dual_port_ram_single_clock.v
+set_global_assignment -name SYSTEMVERILOG_FILE ../rtl/ascon_udp_decrypt.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../rtl/ascon_udp_wrapper.sv
 set_global_assignment -name SYSTEMVERILOG_FILE "../rtl/ascon-verilog/rtl/ascon_core.sv"
 set_global_assignment -name VERILOG_FILE ../rtl/fpga.v

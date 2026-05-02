@@ -6,3 +6,4 @@ sim_build/
 __pycache__/
 *.pyc
 results.xml
+fpga/fpga/

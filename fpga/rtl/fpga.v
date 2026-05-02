@@ -77,12 +77,8 @@ module fpga (
     input  wire [3:0]  ENET1_RX_DATA,
     input  wire        ENET1_RX_DV,
     output wire        ENET1_RST_N,
-    input  wire        ENET1_INT_N,
+    input  wire        ENET1_INT_N
 
-    /*
-     * UART
-     */
-    input  wire        UART_RXD
 );
 
 // ================================================================
@@ -303,10 +299,6 @@ core_inst (
     .phy1_reset_n(ENET1_RST_N),
     .phy1_int_n(ENET1_INT_N),
 
-    /*
-     * UART
-     */
-    .uart_rxd(UART_RXD)
 );
 
 endmodule

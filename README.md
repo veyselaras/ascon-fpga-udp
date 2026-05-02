@@ -1,260 +1,193 @@
-# ASCON-AEAD128 Hardware Encryption over UDP
+# ASCON-AEAD128 FPGA Encryption Gateway
 
-Real-time authenticated encryption on a DE2-115 FPGA board using the ASCON lightweight cipher (NIST SP 800-232). Plaintext UDP packets are encrypted in hardware and returned with a cryptographic authentication tag.
+A real-time hardware encryption gateway built on the **Terasic DE2-115 FPGA** (Cyclone IV E). The FPGA sits between a device and the network, encrypting all outgoing traffic and decrypting all incoming traffic — transparently and entirely in hardware.
 
-## What It Does
-
-1. PC sends a plaintext UDP packet to the FPGA (port 1234)
-2. FPGA encrypts the payload using ASCON-AEAD128
-3. FPGA sends back: `nonce + associated_data + ciphertext + tag`
-4. PC verifies the result against a Python reference implementation
-
-The entire encryption happens in hardware at wire speed. No CPU, no software — just logic gates.
+Uses the **ASCON-AEAD128** algorithm, standardized by NIST as [SP 800-232](https://csrc.nist.gov/pubs/sp/800/232/final) for lightweight authenticated encryption.
 
 ## Architecture
 
 ```
-PC (UDP)                         FPGA (DE2-115)
-────────                         ──────────────
+                              FPGA (Encryption Gateway)
                     ┌──────────────────────────────────────────┐
-  plaintext ──────> │ UDP RX ──> Async FIFO ──> ASCON Wrapper  │
-                    │              125MHz    ──>   62.5MHz     │
-                    │                               │          │
-                    │                          ┌────┴────┐     │
-                    │                          │  ASCON  │     │
-                    │                          │  Core   │     │
-                    │                          │ (SP 800 │     │
-                    │                          │  -232)  │     │
-                    │                          └────┬────┘     │
-                    │                               │          │
-  nonce+AD+CT+tag <─│ UDP TX <── Async FIFO <── encrypted      │
-                    │              125MHz    <──   62.5MHz     │
+                    │                                          │
+  PLC/PC ──plain──► │ ENET0 RX → FIFO → Encrypt → FIFO → ENET1 TX │ ──cipher──► Network
+ (10.0.0.2)        │                                          │          (192.168.1.129)
+                    │                                          │
+  PLC/PC ◄──plain── │ ENET0 TX ← FIFO ← Decrypt ← FIFO ← ENET1 RX │ ◄──cipher── Network
+                    │                                          │
                     └──────────────────────────────────────────┘
+                         10.0.0.1              192.168.1.128
+                        (plaintext)            (encrypted)
 ```
 
-### Clock Domains
+- **ENET0** connects directly to the device (PLC, PC, sensor, etc.) with a cable — no switch. Plaintext never leaves this link.
+- **ENET1** connects to the network. Only encrypted and authenticated data appears here.
+- Both directions work simultaneously. The device needs no special software — it sends and receives normal UDP packets.
 
-The Ethernet MAC and UDP stack run at 125 MHz. The ASCON core runs at 62.5 MHz to meet timing on Cyclone IV. Two asynchronous FIFOs handle the clock domain crossing.
+## How It Works
 
-### Output Packet Format
+### Encrypt Path (Device → Network)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| Nonce | 16 bytes | Used for this encryption (fixed in current version) |
-| AD | 4 bytes | Associated data (authenticated but not encrypted) |
-| Ciphertext | N bytes | Encrypted payload (same length as input) |
-| Tag | 16 bytes | Authentication tag for integrity verification |
+1. Device sends a UDP packet to FPGA ENET0 (port 1234)
+2. Packet crosses from 125 MHz to 62.5 MHz domain via async FIFO
+3. ASCON-AEAD128 encrypts the payload and generates an authentication tag
+4. Output packet (nonce + AD + ciphertext + tag) crosses back to 125 MHz
+5. FPGA sends the encrypted UDP packet out through ENET1
 
-Total output = input length + 36 bytes.
+### Decrypt Path (Network → Device)
 
-## Hardware
+1. Encrypted UDP packet arrives at FPGA ENET1 (port 1234)
+2. Packet crosses to 62.5 MHz domain via async FIFO
+3. ASCON-AEAD128 decrypts the ciphertext and verifies the authentication tag
+4. If tag is valid: plaintext is sent to the device through ENET0
+5. If tag is invalid: packet is silently dropped — nothing reaches the device
 
-- **FPGA Board**: Terasic DE2-115 (Cyclone IV E, EP4CE115F29C7)
-- **PHY**: Marvell Alaska 88E1111 (RGMII, 1000BASE-T)
-- **Connection**: Gigabit Ethernet via Cat5e/Cat6 cable
-- **Switch**: Any unmanaged gigabit switch (tested with TP-Link LS105G)
-
-## Test Results
-
-### Hardware Verification
-
-Plaintext packets sent from PC, encrypted by the FPGA, and verified against the ASCON SP 800-232 Python reference:
-
-![Hardware Test 1](docs/bt1.png)
-
-![Hardware Test 2](docs/bt2.png)
-
-All ciphertext and tag outputs match the reference implementation exactly.
-
-### RTL Simulation (Cocotb + Verilator)
-
-Six test cases covering different payload sizes and consecutive packets:
-
-![Testbench Results 1](docs/tb1.png)
-
-![Testbench Results 2](docs/tb2.png)
-
-![Testbench Results 3](docs/tb3.png)
-
-## Project Structure
+### Encrypted Packet Format
 
 ```
-DE2-115/
-├── README.md
-├── test_fpga_udp.py                # Hardware verification script
-├── docs/
-│   ├── bt1.png                     # Hardware test results
-│   ├── bt2.png
-│   ├── tb1.png                     # Testbench results
-│   ├── tb2.png
-│   └── tb3.png
-└── fpga/
-    ├── fpga.qsf                    # Quartus project settings
-    ├── fpga.qpf                    # Quartus project file
-    ├── rtl/
-    │   ├── fpga.v                  # Top-level (PLL: 125MHz + 62.5MHz)
-    │   ├── fpga_core.v             # Core logic (UDP + async FIFOs + ASCON)
-    │   ├── ascon_udp_wrapper.sv    # AXI-Stream ↔ ASCON bridge (main module)
-    │   ├── hex_display.v           # 7-segment display driver
-    │   ├── sync_signal.v           # Signal synchronizer
-    │   ├── debounce_switch.v       # Button/switch debouncer
-    │   └── ascon-verilog/          # ASCON core (submodule)
-    │       └── rtl/
-    │           ├── ascon_core.sv
-    │           ├── asconp.sv
-    │           ├── config.sv
-    │           ├── functions.sv
-    │           └── register.sv
-    └── tb/
-        └── ascon_udp_wrapper/
-            ├── Makefile            # Cocotb + Verilator simulation
-            └── test_wrapper.py     # Testbench (6 test cases)
+[Nonce - 16 bytes][AD - 4 bytes][Ciphertext - N bytes][Tag - 16 bytes]
 ```
 
-### Dependencies
+Total overhead: 36 bytes per packet.
 
-This project depends on two open-source repositories:
+## Modules
 
-| Dependency | What It Provides | Link |
-|------------|-----------------|------|
-| [verilog-ethernet](https://github.com/alexforencich/verilog-ethernet) | Ethernet MAC, UDP/IP stack, AXI-Stream FIFOs | Clone separately |
-| [ascon-verilog](https://github.com/rprimas/ascon-verilog) | ASCON-AEAD128 core (SP 800-232) | Included as submodule in `rtl/ascon-verilog/` |
+| Module | Count | Purpose |
+|--------|-------|---------|
+| `udp_complete` | 2 | Full UDP/IP/ARP stack for each Ethernet port |
+| `eth_mac_1g_rgmii_fifo` | 2 | Gigabit Ethernet MAC (RGMII) for each port |
+| `ascon_udp_wrapper` | 1 | Encrypt wrapper — feeds plaintext to ASCON, outputs nonce+AD+CT+tag |
+| `ascon_udp_decrypt` | 1 | Decrypt wrapper — parses nonce+AD+CT+tag, outputs plaintext |
+| `axis_async_fifo` | 4 | Clock domain crossing (125 MHz ↔ 62.5 MHz) |
+| `true_dual_port_ram` | 4 | Block RAM (M9K) for packet buffering |
 
-The Ethernet library provides modules like `eth_mac_1g_rgmii_fifo`, `udp_complete`, `axis_fifo`, and `axis_async_fifo`. These are referenced from the verilog-ethernet `lib/` directory and are not copied into this repo.
+## Clock Domains
 
-## Setup
+| Clock | Frequency | Usage |
+|-------|-----------|-------|
+| CLK0 | 125 MHz | Ethernet MAC, UDP/IP, ARP |
+| CLK1 | 125 MHz + 90° | RGMII TX timing |
+| CLK2 | 62.5 MHz | ASCON encrypt/decrypt cores |
 
-### 1. Clone
+All three clocks are generated from the 50 MHz board oscillator using the Cyclone IV PLL. Clock domain crossing between 125 MHz and 62.5 MHz is handled by asynchronous FIFOs with proper synchronization.
 
-```bash
-git clone --recursive https://github.com/<your-username>/ascon-fpga-udp.git
-git clone https://github.com/alexforencich/verilog-ethernet.git
-```
+## Security Features
 
-### 2. Quartus Project
+- **Physical isolation**: Plaintext exists only on the direct cable between the device and ENET0. No plaintext ever reaches the network switch.
+- **Authenticated encryption**: ASCON-AEAD128 provides both confidentiality and integrity. Tampered packets fail tag verification and are dropped.
+- **Dynamic nonce**: An LFSR generates a unique 128-bit nonce for each packet, preventing nonce reuse attacks.
+- **Pure hardware**: No CPU, no software, no OS — no software-level attack surface.
 
-1. Open `fpga/fpga.qpf` in Intel Quartus Prime Lite 20.1+
-2. Make sure these lines are in the QSF file:
-   ```
-   set_global_assignment -name SEARCH_PATH "rtl/ascon-verilog/rtl"
-   set_global_assignment -name SYSTEMVERILOG_FILE rtl/ascon-verilog/rtl/ascon_core.sv
-   set_global_assignment -name SYSTEMVERILOG_FILE rtl/ascon_udp_wrapper.sv
-   ```
-3. Compile: Processing → Start Compilation
-4. Program: Tools → Programmer
+## Network Configuration
 
-### 3. Network Setup (Linux)
+| Parameter | ENET0 (Plaintext) | ENET1 (Encrypted) |
+|-----------|-------------------|-------------------|
+| IP Address | 10.0.0.1 | 192.168.1.128 |
+| MAC Address | 02:00:00:00:00:00 | 02:00:00:00:00:01 |
+| Subnet | 255.255.255.0 | 255.255.255.0 |
+| Target IP | 10.0.0.2 (device) | 192.168.1.129 (remote FPGA) |
+| UDP Port | 1234 | 1234 |
 
-```bash
-sudo ip addr add 192.168.1.100/24 dev <interface>
-sudo ip link set <interface> up
-sudo arp -s 192.168.1.128 02:00:00:00:00:00 -i <interface>
-```
-
-Replace `<interface>` with your Ethernet adapter name (e.g., `enp45s0`).
-
-### 4. Reset
-
-Press **KEY3** on the DE2-115 board to reset the system.
-
-## Testing
-
-### Quick Test
-
-```bash
-echo -n "hello" | netcat -u -w2 192.168.1.128 1234 | xxd
-```
-
-Expected: 41 bytes (16 nonce + 4 AD + 5 ciphertext + 16 tag).
-
-### Hardware Verification
-
-```bash
-python3 test_fpga_udp.py
-```
-
-Sends test packets to the FPGA and verifies the encrypted output against the ASCON SP 800-232 Python reference.
-
-### RTL Simulation
-
-```bash
-pip install cocotb
-sudo apt install verilator
-
-cd fpga/tb/ascon_udp_wrapper
-make
-```
-
-Runs 6 tests: 1-byte, 4-byte, 5-byte, 8-byte, 13-byte, and consecutive packets.
-
-## ASCON Wrapper Design
-
-The `ascon_udp_wrapper` module bridges the 8-bit AXI-Stream interface (UDP payload) to the 32-bit ASCON core interface.
-
-### Main FSM
-
-| State | Action |
-|-------|--------|
-| `S_IDLE` | Wait for data from FIFO |
-| `S_GET_UDP_FIFO_DATA` | Buffer incoming plaintext bytes |
-| `S_SEND_MODE` | Set ASCON to encryption mode |
-| `S_SEND_KEY` | Feed 128-bit key (4 x 32-bit words) |
-| `S_SEND_NONCE` | Feed 128-bit nonce (4 x 32-bit words) |
-| `S_SEND_AD` | Feed associated data (1 x 32-bit word) |
-| `S_SEND_PLAINTEXT` | Feed plaintext words, capture ciphertext |
-| `S_GET_TAG` | Read 128-bit authentication tag |
-| `S_SEND2TX` | Serialize nonce+AD+CT+tag to 8-bit output |
-
-### Output Sub-FSM (inside S_SEND2TX)
-
-| Phase | Data | Bytes |
-|-------|------|-------|
-| `S_TX_NONCE` | Fixed nonce | 16 |
-| `S_TX_AD` | Associated data | 4 |
-| `S_TX_ENC_DATA` | Ciphertext | N |
-| `S_TX_TAG` | Authentication tag | 16 |
-
-### Key Design Decisions
-
-- **Combinational + Sequential split**: Outputs to the ASCON core are driven combinationally for zero extra latency. State transitions and memory writes are sequential.
-- **Pipeline stage for ciphertext capture**: The `bdo` output is registered before writing to the encrypted data buffer. This breaks a long combinational path through the 256-entry memory.
-- **Registered output data**: The `m_axis_tdata` byte is pre-loaded one cycle ahead to cut the timing path through the UDP checksum logic.
-- **Clock domain crossing**: ASCON runs at 62.5 MHz (half the Ethernet clock) because the ASCON permutation has too much combinational depth for 125 MHz on Cyclone IV. Two `axis_async_fifo` instances handle the crossing safely.
-
-## Configuration
-
-Currently hardcoded in `ascon_udp_wrapper.sv`:
-
-| Parameter | Value |
-|-----------|-------|
-| Key | `128'h000102030405060708090A0B0C0D0E0F` |
-| Nonce | `128'h0F0E0D0C0B0A09080706050403020100` |
-| AD | `128'h000000000000000000000000DDEEFF00` (first 4 bytes used) |
-| Max plaintext | 256 bytes |
-| ASCON variant | v1 (32-bit bus, 1 round/cycle) |
+Two separate subnets ensure plaintext and encrypted traffic are physically separated.
 
 ## Resource Usage
 
 | Resource | Used | Available | Utilization |
 |----------|------|-----------|-------------|
-| Logic Elements | 18,038 | 114,480 | ~15% |
-| Registers | 8,782 | - | - |
-| Memory Bits | 215,552 | 3,981,312 | ~5% |
+| Logic Elements | ~30,000 | 114,480 | ~26% |
+| M9K Memory Blocks | ~16 | 432 | ~4% |
+| Registers | ~8,000 | - | - |
+| PLLs | 1 | 4 | 25% |
 
-## Future Work
+## Hardware
 
-- Second FPGA for decryption (full encrypt-decrypt loop)
-- Dynamic key and nonce (per-packet via UDP header fields)
+- **FPGA Board**: [Terasic DE2-115](https://www.terasic.com.tw/cgi-bin/page/archive.pl?No=502)
+- **FPGA Chip**: Cyclone IV E (EP4CE115F29C7)
+- **Ethernet PHY**: Marvell Alaska 88E1111 × 2 (RGMII, 1000BASE-T)
+- **Connection**: Cat5e/Cat6 cables, one per port
 
-## References
+## Verification
 
-- [ASCON - NIST SP 800-232](https://csrc.nist.gov/pubs/sp/800/232/final)
-- [ASCON Verilog Core](https://github.com/rprimas/ascon-verilog) by Robert Primas
-- [Verilog Ethernet](https://github.com/alexforencich/verilog-ethernet) by Alex Forencich
-- [Terasic DE2-115](https://www.terasic.com.tw/cgi-bin/page/archive.pl?No=502)
+### RTL Simulation (Cocotb + Verilator)
+
+- Encrypt wrapper: 7 tests (1, 4, 5, 7, 8, 13 bytes + consecutive packets)
+- Decrypt wrapper: 8 tests (same sizes + corrupted tag + recovery after auth fail)
+- All tests verified against Python reference implementation (pyascon)
+
+### Hardware Testing
+
+Tested with two PCs:
+- **PC1 (Linux)**: Connected to ENET0, sends plaintext, receives decrypted data
+- **PC2 (Windows)**: Connected to ENET1, receives encrypted packets, sends encrypted data for decrypt testing
+
+All 5 test vectors verified — ciphertext and tag matched pyascon reference output byte-for-byte.
+
+## Project Structure
+
+```
+fpga/
+├── rtl/
+│   ├── fpga.v                    # Top level (PLL, resets, GPIO)
+│   ├── fpga_core.v               # Main logic (dual-port, bidirectional)
+│   ├── ascon_udp_wrapper.sv      # Encrypt wrapper
+│   ├── ascon_udp_decrypt.sv      # Decrypt wrapper
+│   ├── true_dual_port_ram.v      # Block RAM module
+│   ├── config_local.sv           # Quartus enum width fix
+│   └── ascon-verilog/            # ASCON core (submodule)
+├── tb/
+│   ├── ascon_udp_wrapper/        # Encrypt cocotb testbench
+│   └── ascon_udp_decrypt/        # Decrypt cocotb testbench
+├── fpga.sdc                      # Timing constraints
+└── fpga.qsf                      # Quartus pin assignments
+```
+
+## Dependencies
+
+| Library | Provides | Source |
+|---------|----------|--------|
+| [verilog-ethernet](https://github.com/alexforencich/verilog-ethernet) | Ethernet MAC, UDP/IP, AXI-Stream FIFO, ARP | Alex Forencich |
+| [ascon-verilog](https://github.com/rprimas/ascon-verilog) | ASCON-AEAD128 core (SP 800-232) | Robert Primas |
+
+## Quick Start
+
+### Build
+
+1. Clone this repo and initialize submodules
+2. Open `fpga/fpga.qpf` in Quartus Prime
+3. Compile (Analysis & Synthesis → Fitter → Assembler)
+4. Program the FPGA via JTAG
+
+### Test (Encrypt Path)
+
+```bash
+# PC1 (Linux) — connect to ENET0
+sudo ip addr add 10.0.0.2/24 dev eth0
+sudo arp -s 10.0.0.1 02:00:00:00:00:00
+
+# PC2 (Windows) — connect to ENET1
+# Set IP: 192.168.1.129, Subnet: 255.255.255.0
+# CMD (admin): arp -s 192.168.1.128 02-00-00-00-00-01
+
+# PC2: Start listener
+python pc2_test.py 1
+
+# PC1: Send plaintext
+python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b'hello',('10.0.0.1',1234))"
+
+# PC2 receives encrypted packet with nonce, AD, ciphertext, and tag
+```
+
+## Author
+
+**Veysel Aras**
+
+Advisor: Prof. Dr. İbrahim Özçelik
+
+## Acknowledgments
+
+- [Robert Primas](https://github.com/rprimas) — ASCON Verilog implementation
+- [Alex Forencich](https://github.com/alexforencich) — Verilog Ethernet components
 
 ## License
 
-- ASCON core: [CC0-1.0](https://github.com/rprimas/ascon-verilog/blob/main/LICENSE)
-- Ethernet modules: [MIT](https://github.com/alexforencich/verilog-ethernet/blob/master/COPYING)
-- Wrapper and integration: MIT
+This project uses open-source components. See individual repositories for their licenses.

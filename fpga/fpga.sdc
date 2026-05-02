@@ -61,9 +61,9 @@ source ../lib/eth/lib/axis/syn/quartus/axis_async_fifo.sdc
 constrain_sync_reset_inst "sync_reset_inst"
 
 # ENET0 RGMII MAC
-constrain_eth_mac_1g_rgmii_inst "core_inst|eth_mac_inst|eth_mac_1g_rgmii_inst"
-constrain_axis_async_fifo_inst "core_inst|eth_mac_inst|rx_fifo|fifo_inst"
-constrain_axis_async_fifo_inst "core_inst|eth_mac_inst|tx_fifo|fifo_inst"
+constrain_eth_mac_1g_rgmii_inst "core_inst|eth_mac_0|eth_mac_1g_rgmii_inst"
+constrain_axis_async_fifo_inst "core_inst|eth_mac_0|rx_fifo|fifo_inst"
+constrain_axis_async_fifo_inst "core_inst|eth_mac_0|tx_fifo|fifo_inst"
 
 # ENET0 RGMII interface
 constrain_rgmii_input_pins "enet0" "ENET0_RX_CLK" "ENET0_RX_DV ENET0_RX_D*"
@@ -73,3 +73,25 @@ constrain_rgmii_output_pins "enet0" "altpll_component|auto_generated|pll1|clk[0]
 constrain_rgmii_input_pins "enet1" "ENET1_RX_CLK" "ENET1_RX_DV ENET1_RX_D*"
 constrain_rgmii_output_pins "enet1" "altpll_component|auto_generated|pll1|clk[0]" "ENET1_GTX_CLK" "ENET1_TX_EN ENET1_TX_D*"
 
+# ENET1 MAC
+constrain_eth_mac_1g_rgmii_inst "core_inst|eth_mac_1|eth_mac_1g_rgmii_inst"
+constrain_axis_async_fifo_inst "core_inst|eth_mac_1|rx_fifo|fifo_inst"
+constrain_axis_async_fifo_inst "core_inst|eth_mac_1|tx_fifo|fifo_inst"
+
+# ASCON CDC async FIFOs
+constrain_axis_async_fifo_inst "core_inst|enc_rx_fifo"
+constrain_axis_async_fifo_inst "core_inst|enc_tx_fifo"
+constrain_axis_async_fifo_inst "core_inst|dec_rx_fifo"
+constrain_axis_async_fifo_inst "core_inst|dec_tx_fifo"
+
+# ================================================================
+# CDC false paths (125MHz <-> 62.5MHz, async FIFO koruyor)
+# ================================================================
+set_false_path -from [get_clocks {altpll_component|auto_generated|pll1|clk[0]}] -to [get_clocks {altpll_component|auto_generated|pll1|clk[2]}]
+set_false_path -from [get_clocks {altpll_component|auto_generated|pll1|clk[2]}] -to [get_clocks {altpll_component|auto_generated|pll1|clk[0]}]
+
+# ================================================================
+# ARP cache timing relaxation
+# ================================================================
+set_max_delay 11 -from [get_registers {*arp_cache*rd_ptr_reg*}] -to [get_registers {*query_response*}]
+set_min_delay 0 -from [get_registers {*arp_cache*rd_ptr_reg*}] -to [get_registers {*query_response*}]
