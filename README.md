@@ -157,25 +157,139 @@ fpga/
 3. Compile (Analysis & Synthesis → Fitter → Assembler)
 4. Program the FPGA via JTAG
 
-### Test (Encrypt Path)
+## Quick Start
+
+### Hardware Connections
+
+Connect the two PCs to the FPGA Ethernet ports as follows:
+
+| Device        | FPGA Port          | Role           | IP Network    |
+| ------------- | ------------------ | -------------- | ------------- |
+| PC1 — Linux   | ENET0, top port    | Plaintext side | `10.0.0.x`    |
+| PC2 — Windows | ENET1, bottom port | Encrypted side | `192.168.1.x` |
+
+---
+
+## Build
+
+1. Clone the repository and initialize the submodules:
 
 ```bash
-# PC1 (Linux) — connect to ENET0
-sudo ip addr add 10.0.0.2/24 dev eth0
-sudo arp -s 10.0.0.1 02:00:00:00:00:00
-
-# PC2 (Windows) — connect to ENET1
-# Set IP: 192.168.1.129, Subnet: 255.255.255.0
-# CMD (admin): arp -s 192.168.1.128 02-00-00-00-00-01
-
-# PC2: Start listener
-python pc2_test.py 1
-
-# PC1: Send plaintext
-python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b'hello',('10.0.0.1',1234))"
-
-# PC2 receives encrypted packet with nonce, AD, ciphertext, and tag
+git clone --recursive <repository-url>
+cd <repository-folder>
 ```
+
+If the repository was cloned without `--recursive`, run:
+
+```bash
+git submodule update --init --recursive
+```
+
+2. Open the Quartus project:
+
+```text
+fpga/fpga.qpf
+```
+
+3. Compile the design in Quartus Prime:
+
+```text
+Analysis & Synthesis → Fitter → Assembler
+```
+
+4. Program the FPGA through JTAG.
+
+5. After programming, press **KEY3** to reset the FPGA design.
+
+---
+
+## Test Setup — Encrypt Path
+
+This test verifies the encryption path:
+
+```text
+PC1/Linux → ENET0 → FPGA encryption gateway → ENET1 → PC2/Windows
+```
+
+PC1 sends plaintext UDP data to the FPGA.
+The FPGA encrypts the payload and forwards the encrypted packet to PC2.
+
+---
+
+### PC1 — Linux Setup
+
+Connect PC1 to **ENET0**.
+
+Configure the Linux Ethernet interface:
+
+```bash
+sudo ip addr add 10.0.0.2/24 dev enp45s0
+sudo ip link set enp45s0 up
+sudo arp -s 10.0.0.1 02:00:00:00:00:00 -i enp45s0
+```
+
+> Note: If your Linux Ethernet interface name is different, replace `enp45s0` with the correct interface name. You can check it using:
+
+```bash
+ip link
+```
+
+---
+
+### PC2 — Windows Setup
+
+Connect PC2 to **ENET1**.
+
+Set the Windows Ethernet adapter manually:
+
+```text
+IP address: 192.168.1.129
+Subnet mask: 255.255.255.0
+Gateway: leave empty
+```
+
+Open **Command Prompt as Administrator** and add the ARP entry:
+
+```cmd
+arp -s 192.168.1.128 02-00-00-00-00-01
+```
+
+Make sure Python 3 is installed on Windows. During installation, enable:
+
+```text
+Add python.exe to PATH
+```
+
+Temporarily disable Windows Defender Firewall during the test if packets are blocked.
+
+---
+
+## Running the Test
+
+Start the receiver on **PC2 / Windows** first:
+
+```cmd
+python pc2_test.py 1
+```
+
+Then start the sender on **PC1 / Linux**:
+
+```bash
+python3 pc1_test.py 1
+```
+
+Expected result:
+
+```text
+PC1 sends a plaintext UDP packet.
+The FPGA receives it from ENET0.
+The FPGA encrypts the UDP payload.
+The encrypted packet is transmitted from ENET1.
+PC2 receives and displays the encrypted packet.
+```
+
+The received encrypted packet should contain the nonce, associated data, ciphertext, and authentication tag.
+
 
 ## Author
 
